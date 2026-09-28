@@ -192,6 +192,7 @@ export async function POST(request: NextRequest) {
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
         temperature: 0.2,
+        stream: true,
         messages: [
           { role: "system", content: systemPrompt },
           ...history,
@@ -203,49 +204,100 @@ export async function POST(request: NextRequest) {
     });
 
     if (!modelResponse.ok) throw new Error(`OpenAI returned ${modelResponse.status}.`);
-    const modelPayload = (await modelResponse.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const answer = modelPayload.choices?.[0]?.message?.content?.trim();
-    if (!answer) throw new Error("OpenAI returned an empty answer.");
+    if (!modelResponse.body) throw new Error("OpenAI returned an empty stream.");
 
-    const precedingAssistant = history.at(-1)?.role === "assistant" ? history.slice(-1) : [];
-    const memoryTranscript = [
-      ...precedingAssistant,
-      { role: "user", content: message },
-      { role: "assistant", content: answer },
-    ] as ChatMessage[];
-    const write = await memory.add(
-      memoryTranscript,
-      externalUserId,
-      undefined,
-      { channel: "design-partner-assistant" },
-      undefined,
-      `assistant-${crypto.randomUUID()}`,
-    );
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: Record<string, unknown>) => {
+          controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+        };
 
-    return NextResponse.json({
-      answer,
-      retrievalId: retrieved.retrievalId,
-      clarification,
-      memory: {
-        quotaMode: retrieved.quotaMode,
-        circuitStatus: retrieved.circuitStatus,
-        cached: retrieved.cached,
-        items: retrieved.items.map((item) => ({
-          id: item.id,
-          content: item.content,
-          category: item.category,
-          relevanceScore: item.relevanceScore,
-          sourceEventId: item.sourceEventId,
-          provenance: item.provenance,
-        })),
+        try {
+          const reader = modelResponse.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let answer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            buffer += decoder.decode(value, { stream: !done });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const rawLine of lines) {
+              const line = rawLine.trim();
+              if (!line.startsWith("data:")) continue;
+              const data = line.slice(5).trim();
+              if (!data || data === "[DONE]") continue;
+              const event = JSON.parse(data) as {
+                choices?: Array<{ delta?: { content?: string } }>;
+              };
+              const delta = event.choices?.[0]?.delta?.content;
+              if (!delta) continue;
+              answer += delta;
+              send({ type: "delta", delta });
+            }
+
+            if (done) break;
+          }
+
+          answer = answer.trim();
+          if (!answer) throw new Error("OpenAI returned an empty answer.");
+
+          const precedingAssistant = history.at(-1)?.role === "assistant" ? history.slice(-1) : [];
+          const memoryTranscript = [
+            ...precedingAssistant,
+            { role: "user", content: message },
+            { role: "assistant", content: answer },
+          ] as ChatMessage[];
+          const write = await memory.add(
+            memoryTranscript,
+            externalUserId,
+            undefined,
+            { channel: "design-partner-assistant" },
+            undefined,
+            `assistant-${crypto.randomUUID()}`,
+          );
+
+          send({
+            type: "complete",
+            retrievalId: retrieved.retrievalId,
+            clarification,
+            memory: {
+              quotaMode: retrieved.quotaMode,
+              circuitStatus: retrieved.circuitStatus,
+              cached: retrieved.cached,
+              items: retrieved.items.map((item) => ({
+                id: item.id,
+                content: item.content,
+                category: item.category,
+                relevanceScore: item.relevanceScore,
+                sourceEventId: item.sourceEventId,
+                provenance: item.provenance,
+              })),
+            },
+            write: {
+              jobId: write.jobId,
+              status: write.status,
+              quotaMode: write.quotaMode,
+              nothingToExtract: write.nothingToExtract,
+            },
+          });
+        } catch (error) {
+          console.error("assistant_stream_failed", error);
+          send({ type: "error", error: "The assistant could not complete this turn. Please try again." });
+        } finally {
+          controller.close();
+        }
       },
-      write: {
-        jobId: write.jobId,
-        status: write.status,
-        quotaMode: write.quotaMode,
-        nothingToExtract: write.nothingToExtract,
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Content-Type-Options": "nosniff",
       },
     });
   } catch (error) {

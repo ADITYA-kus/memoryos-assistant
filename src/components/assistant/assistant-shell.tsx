@@ -50,6 +50,11 @@ type AssistantResponse = {
   write?: { jobId?: string | null; status: string; nothingToExtract: boolean };
 };
 
+type AssistantStreamEvent = AssistantResponse & {
+  type: "delta" | "complete" | "error";
+  delta?: string;
+};
+
 function writeStatusLabel(write: AssistantResponse["write"]): string {
   if (!write) return "";
   if (write.nothingToExtract) return "No durable memory found";
@@ -69,6 +74,7 @@ export function AssistantShell() {
   const [memoryState, setMemoryState] = React.useState({ quotaMode: "READY", circuitStatus: "HEALTHY", cached: false });
   const [writeStatus, setWriteStatus] = React.useState("");
   const [loading, setLoading] = React.useState(false);
+  const [streamingTurnId, setStreamingTurnId] = React.useState<string | null>(null);
   const [resolvingClarificationId, setResolvingClarificationId] = React.useState<string | null>(null);
   const [resolvedClarifications, setResolvedClarifications] = React.useState<Record<string, ClarificationAnswer>>({});
   const [error, setError] = React.useState("");
@@ -77,7 +83,7 @@ export function AssistantShell() {
   const bottomRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    bottomRef.current?.scrollIntoView({ behavior: loading ? "auto" : "smooth", block: "end" });
   }, [messages, loading, error, resolvingClarificationId]);
 
   async function sendMessage() {
@@ -92,32 +98,74 @@ export function AssistantShell() {
     setLoading(true);
 
     try {
+      const assistantTurnId = crypto.randomUUID();
       const response = await fetch("/api/assistant", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, history }),
       });
-      const payload = (await response.json()) as AssistantResponse;
-      if (!response.ok || !payload.answer) throw new Error(payload.error ?? "The assistant could not answer.");
-      setMessages((current) => [...current, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: payload.answer!,
-        clarification: payload.clarification,
-      }]);
-      if (payload.memory) {
-        setEvidence(payload.memory.items);
-        setMemoryState({
-          quotaMode: payload.memory.quotaMode,
-          circuitStatus: payload.memory.circuitStatus,
-          cached: payload.memory.cached,
-        });
+      if (!response.ok || !response.body) {
+        const payload = (await response.json().catch(() => null)) as AssistantResponse | null;
+        throw new Error(payload?.error ?? "The assistant could not answer.");
       }
-      setWriteStatus(writeStatusLabel(payload.write));
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantStarted = false;
+      let completed = false;
+
+      const consumeEvent = (event: AssistantStreamEvent) => {
+        if (event.type === "error") throw new Error(event.error ?? "The assistant could not answer.");
+        if (event.type === "delta" && event.delta) {
+          if (!assistantStarted) {
+            assistantStarted = true;
+            setStreamingTurnId(assistantTurnId);
+            setMessages((current) => [...current, { id: assistantTurnId, role: "assistant", content: event.delta! }]);
+          } else {
+            setMessages((current) => current.map((turn) => (
+              turn.id === assistantTurnId ? { ...turn, content: turn.content + event.delta } : turn
+            )));
+          }
+          return;
+        }
+        if (event.type !== "complete") return;
+
+        completed = true;
+        if (event.clarification) {
+          setMessages((current) => current.map((turn) => (
+            turn.id === assistantTurnId ? { ...turn, clarification: event.clarification } : turn
+          )));
+        }
+        if (event.memory) {
+          setEvidence(event.memory.items);
+          setMemoryState({
+            quotaMode: event.memory.quotaMode,
+            circuitStatus: event.memory.circuitStatus,
+            cached: event.memory.cached,
+          });
+        }
+        setWriteStatus(writeStatusLabel(event.write));
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          consumeEvent(JSON.parse(line) as AssistantStreamEvent);
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) consumeEvent(JSON.parse(buffer) as AssistantStreamEvent);
+      if (!assistantStarted || !completed) throw new Error("The assistant response ended unexpectedly. Please try again.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The assistant could not answer.");
     } finally {
       sendingRef.current = false;
+      setStreamingTurnId(null);
       setLoading(false);
     }
   }
@@ -236,6 +284,7 @@ export function AssistantShell() {
                       {turn.role === "assistant" && <div className="grid size-8 shrink-0 place-items-center rounded-xl border border-[#9EFF7A]/20 bg-[#9EFF7A]/10"><Sparkles className="size-3.5 text-[#9EFF7A]" /></div>}
                       <div className={`max-w-[82%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${turn.role === "user" ? "bg-white text-black" : "border border-white/[0.08] bg-white/[0.035] text-white/80"}`}>
                         {turn.content}
+                        {turn.id === streamingTurnId && <span aria-hidden="true" className="ml-1 inline-block h-4 w-1 animate-pulse rounded-full bg-[#9EFF7A]/80 align-[-2px]" />}
                         {turn.role === "assistant" && turn.clarification && (
                           <div className="mt-4 whitespace-normal rounded-xl border border-[#9EFF7A]/20 bg-[#9EFF7A]/[0.045] p-3.5">
                             <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.12em] text-[#9EFF7A]"><ShieldCheck className="size-3.5" /> Memory check</div>
