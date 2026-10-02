@@ -9,19 +9,16 @@ import {
   ShieldCheck, Sparkles,
 } from "lucide-react";
 import { Logo } from "@/components/site/logo";
+import type { MemoryClarification, MemorySourceReview, MemorySourceReviewAnswerResult } from "memoryo-sdk";
+import { SourceReviewCard, sourceReviewKey, type SourceReviewAction, type SourceReviewState } from "./source-review-card";
 
-type ClarificationAnswer = "A" | "B" | "both" | "neither";
-type MemoryClarification = {
-  id: string;
-  question: string;
-  options: Array<{ answer: ClarificationAnswer; label: string; memoryId: string | null }>;
-  expiresAt: string | null;
-};
+type ClarificationAnswer = MemoryClarification["options"][number]["answer"];
 type ChatTurn = {
   id: string;
   role: "user" | "assistant";
   content: string;
   clarification?: MemoryClarification | null;
+  sourceReviews?: MemorySourceReview[];
 };
 type EvidenceItem = {
   id: string;
@@ -36,6 +33,8 @@ type AssistantResponse = {
   answer?: string;
   error?: string;
   clarification?: MemoryClarification | null;
+  sourceReviews?: MemorySourceReview[];
+  sourceReviewResolution?: MemorySourceReviewAnswerResult;
   clarificationResolution?: {
     resolved: boolean;
     clarificationId: string;
@@ -51,7 +50,7 @@ type AssistantResponse = {
 };
 
 type AssistantStreamEvent = AssistantResponse & {
-  type: "delta" | "complete" | "error";
+  type: "context" | "delta" | "complete" | "error";
   delta?: string;
 };
 
@@ -77,18 +76,22 @@ export function AssistantShell() {
   const [streamingTurnId, setStreamingTurnId] = React.useState<string | null>(null);
   const [resolvingClarificationId, setResolvingClarificationId] = React.useState<string | null>(null);
   const [resolvedClarifications, setResolvedClarifications] = React.useState<Record<string, ClarificationAnswer>>({});
+  const [resolvingReviewKey, setResolvingReviewKey] = React.useState<string | null>(null);
+  const [reviewStates, setReviewStates] = React.useState<Record<string, SourceReviewState>>({});
   const [error, setError] = React.useState("");
   const sendingRef = React.useRef(false);
   const resolvingRef = React.useRef(false);
   const bottomRef = React.useRef<HTMLDivElement>(null);
+  const composerRef = React.useRef<HTMLTextAreaElement>(null);
+  const resolving = Boolean(resolvingClarificationId || resolvingReviewKey);
 
   React.useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: loading ? "auto" : "smooth", block: "end" });
-  }, [messages, loading, error, resolvingClarificationId]);
+  }, [messages, loading, error, resolvingClarificationId, resolvingReviewKey]);
 
   async function sendMessage() {
     const message = draft.trim();
-    if (!message || !user || loading || resolvingClarificationId || sendingRef.current) return;
+    if (!message || !user || loading || resolvingRef.current || sendingRef.current) return;
     sendingRef.current = true;
     const history = messages.map(({ role, content }) => ({ role, content }));
     const userTurn: ChatTurn = { id: crypto.randomUUID(), role: "user", content: message };
@@ -113,14 +116,18 @@ export function AssistantShell() {
       const decoder = new TextDecoder();
       let buffer = "";
       let assistantStarted = false;
+      let tokensStarted = false;
       let completed = false;
 
       const consumeEvent = (event: AssistantStreamEvent) => {
         if (event.type === "error") throw new Error(event.error ?? "The assistant could not answer.");
         if (event.type === "delta" && event.delta) {
+          if (!tokensStarted) {
+            tokensStarted = true;
+            setStreamingTurnId(assistantTurnId);
+          }
           if (!assistantStarted) {
             assistantStarted = true;
-            setStreamingTurnId(assistantTurnId);
             setMessages((current) => [...current, { id: assistantTurnId, role: "assistant", content: event.delta! }]);
           } else {
             setMessages((current) => current.map((turn) => (
@@ -129,13 +136,21 @@ export function AssistantShell() {
           }
           return;
         }
-        if (event.type !== "complete") return;
+        if (event.type !== "context" && event.type !== "complete") return;
 
-        completed = true;
-        if (event.clarification) {
-          setMessages((current) => current.map((turn) => (
-            turn.id === assistantTurnId ? { ...turn, clarification: event.clarification } : turn
-          )));
+        if (event.type === "complete") completed = true;
+        if (event.clarification || event.sourceReviews?.length) {
+          if (!assistantStarted) {
+            assistantStarted = true;
+            setMessages((current) => [...current, {
+              id: assistantTurnId, role: "assistant", content: "",
+              clarification: event.clarification, sourceReviews: event.sourceReviews,
+            }]);
+          } else {
+            setMessages((current) => current.map((turn) => (
+              turn.id === assistantTurnId ? { ...turn, clarification: event.clarification, sourceReviews: event.sourceReviews } : turn
+            )));
+          }
         }
         if (event.memory) {
           setEvidence(event.memory.items);
@@ -145,7 +160,7 @@ export function AssistantShell() {
             cached: event.memory.cached,
           });
         }
-        setWriteStatus(writeStatusLabel(event.write));
+        if (event.type === "complete") setWriteStatus(writeStatusLabel(event.write));
       };
 
       while (true) {
@@ -212,12 +227,57 @@ export function AssistantShell() {
     }
   }
 
+  async function answerSourceReview(review: MemorySourceReview, action: SourceReviewAction) {
+    const key = sourceReviewKey(review);
+    if (!user || loading || sendingRef.current || resolvingRef.current || reviewStates[key]) return;
+    resolvingRef.current = true;
+    setResolvingReviewKey(key);
+    setError("");
+    try {
+      const response = await fetch("/api/assistant", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "answer_source_review", reviewId: review.id, version: review.version, reviewAction: action }),
+      });
+      const payload = (await response.json()) as AssistantResponse;
+      if (!response.ok) {
+        if (response.status === 404 || response.status === 409) {
+          setReviewStates((current) => ({ ...current, [key]: "stale" }));
+        }
+        throw new Error(payload.error ?? "MemoryOS could not accept that review answer.");
+      }
+      const result = payload.sourceReviewResolution;
+      if (!result || result.action !== action || result.reviewId !== review.id ||
+        (action === "restate" ? result.resolved || result.nextStep !== "add_memory" : !result.resolved || result.nextStep !== null)) {
+        throw new Error("MemoryOS returned an unexpected review result. Please refresh the context.");
+      }
+      if (action !== "restate") {
+        setReviewStates((current) => ({ ...current, [key]: action }));
+      }
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(), role: "assistant",
+        content: action === "restate"
+          ? "Please state what should be remembered as current, including where it applies. The review is still pending; nothing new has been stored."
+          : "The pending review is closed. Stored memory and authority were not changed.",
+      }]);
+      if (action === "restate") composerRef.current?.focus();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "MemoryOS could not accept that review answer.");
+    } finally {
+      resolvingRef.current = false;
+      setResolvingReviewKey(null);
+    }
+  }
+
   function newConversation() {
+    if (sendingRef.current || resolvingRef.current || loading) return;
     setMessages([]);
     setEvidence([]);
     setWriteStatus("");
     setResolvingClarificationId(null);
     setResolvedClarifications({});
+    setResolvingReviewKey(null);
+    setReviewStates({});
     setError("");
   }
 
@@ -231,7 +291,7 @@ export function AssistantShell() {
             <button onClick={() => setMobileNavOpen(false)} className="rounded-lg p-2 text-white/50 hover:bg-white/5 lg:hidden" aria-label="Close menu">×</button>
           </div>
           <div className="mt-5 rounded-xl border border-white/[0.08] px-3 py-2.5 text-sm text-white/50">Customer workspace</div>
-          <button onClick={newConversation} className="mt-4 flex items-center justify-center gap-2 rounded-xl bg-[#9EFF7A] px-3 py-3 text-sm font-semibold text-[#071008]">
+          <button onClick={newConversation} disabled={loading || resolving} className="mt-4 flex items-center justify-center gap-2 rounded-xl bg-[#9EFF7A] px-3 py-3 text-sm font-semibold text-[#071008] disabled:opacity-50">
             <MessageSquarePlus className="size-4" /> New conversation
           </button>
           <div className="mt-6">
@@ -292,7 +352,7 @@ export function AssistantShell() {
                             <div className="mt-3 grid gap-2 sm:grid-cols-2">
                               {turn.clarification.options.map((option) => {
                                 const selected = resolvedClarifications[turn.clarification!.id] === option.answer;
-                                const disabled = Boolean(resolvedClarifications[turn.clarification!.id]) || resolvingClarificationId === turn.clarification!.id;
+                                const disabled = Boolean(resolvedClarifications[turn.clarification!.id]) || loading || resolving;
                                 return (
                                   <button
                                     key={`${turn.clarification!.id}-${option.answer}`}
@@ -309,6 +369,10 @@ export function AssistantShell() {
                             {resolvingClarificationId === turn.clarification.id && <div className="mt-2 flex items-center gap-2 text-[11px] text-white/40"><LoaderCircle className="size-3 animate-spin" /> Saving your choice securely…</div>}
                           </div>
                         )}
+                        {turn.role === "assistant" && turn.sourceReviews?.map((review) => {
+                          const key = sourceReviewKey(review);
+                          return <SourceReviewCard key={key} review={review} state={reviewStates[key]} busy={resolvingReviewKey === key} disabled={loading || resolving} onAnswer={(action) => void answerSourceReview(review, action)} />;
+                        })}
                       </div>
                     </div>
                   ))}
@@ -321,10 +385,10 @@ export function AssistantShell() {
 
             <div className="shrink-0 pb-1 pt-4">
               <div className="rounded-2xl border border-white/[0.1] bg-[#0c0f12]/95 p-2 shadow-2xl shadow-black/30 focus-within:border-[#9EFF7A]/30">
-                <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} rows={2} maxLength={2000} placeholder="Ask the assistant…" className="w-full resize-none bg-transparent px-3 py-2 text-[15px] text-white outline-none placeholder:text-white/25" />
+                <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} rows={2} maxLength={2000} placeholder="Ask the assistant…" className="w-full resize-none bg-transparent px-3 py-2 text-[15px] text-white outline-none placeholder:text-white/25" />
                 <div className="flex items-center justify-between px-2 pb-1">
                   <span className="px-1 text-[10px] text-white/25">Signed in as {user?.firstName || "customer"}</span>
-                  <button onClick={() => void sendMessage()} disabled={!draft.trim() || loading || Boolean(resolvingClarificationId) || !user} className="grid size-9 place-items-center rounded-xl bg-[#9EFF7A] text-[#071008] transition hover:bg-[#B5FF99] disabled:cursor-not-allowed disabled:bg-white/[0.08] disabled:text-white/25" aria-label="Send message"><ArrowUp className="size-4" /></button>
+                  <button onClick={() => void sendMessage()} disabled={!draft.trim() || loading || resolving || !user} className="grid size-9 place-items-center rounded-xl bg-[#9EFF7A] text-[#071008] transition hover:bg-[#B5FF99] disabled:cursor-not-allowed disabled:bg-white/[0.08] disabled:text-white/25" aria-label="Send message"><ArrowUp className="size-4" /></button>
                 </div>
               </div>
               <p className="mt-2 text-center text-[10px] text-white/25">MemoryOS is additive: the assistant will continue safely when memory is empty or degraded.</p>

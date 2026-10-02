@@ -6,18 +6,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
-type ClarificationAnswer = "A" | "B" | "both" | "neither";
-type MemoryClarification = {
-  id: string;
-  conflictId: string | null;
-  question: string;
-  options: Array<{
-    answer: ClarificationAnswer;
-    label: string;
-    memoryId: string | null;
-  }>;
-  expiresAt: string | null;
-};
 
 const MAX_MESSAGE_LENGTH = 2_000;
 const MAX_HISTORY_MESSAGES = 10;
@@ -40,87 +28,6 @@ function cleanHistory(value: unknown): ChatMessage[] {
   });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function parseClarification(value: unknown): MemoryClarification | null {
-  if (!isRecord(value) || typeof value.id !== "string" || typeof value.question !== "string") {
-    return null;
-  }
-
-  const options = Array.isArray(value.options)
-    ? value.options.flatMap((option) => {
-        if (!isRecord(option) || typeof option.label !== "string") return [];
-        const answer = option.answer;
-        if (answer !== "A" && answer !== "B" && answer !== "both" && answer !== "neither") return [];
-        const parsedAnswer: ClarificationAnswer = answer;
-        const memoryId = typeof option.memory_id === "string" ? option.memory_id : null;
-        return [{ answer: parsedAnswer, label: option.label, memoryId }];
-      })
-    : [];
-
-  if (!options.length) return null;
-  return {
-    id: value.id,
-    conflictId: typeof value.conflict_id === "string" ? value.conflict_id : null,
-    question: value.question,
-    options,
-    expiresAt: typeof value.expires_at === "string" ? value.expires_at : null,
-  };
-}
-
-async function answerClarification(params: {
-  apiKey: string;
-  clarificationId: string;
-  externalUserId: string;
-  answer: ClarificationAnswer;
-}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MemoryOS.DEFAULT_TIMEOUT);
-  try {
-    const response = await fetch(
-      `${MemoryOS.DEFAULT_BASE_URL}/v1/memories/clarifications/${encodeURIComponent(params.clarificationId)}/answer`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `ApiKey ${params.apiKey}`,
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          external_user_id: params.externalUserId,
-          answer: params.answer,
-        }),
-        signal: controller.signal,
-        cache: "no-store",
-      },
-    );
-    const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-    if (!response.ok) {
-      throw new MemoryOSError(
-        typeof payload?.error === "string" ? payload.error : `MemoryOS returned ${response.status}.`,
-        {
-          statusCode: response.status,
-          code: typeof payload?.code === "string" ? payload.code : undefined,
-          requestId: typeof payload?.request_id === "string" ? payload.request_id : undefined,
-        },
-      );
-    }
-    const data = isRecord(payload?.data) ? payload.data : null;
-    if (!data || data.resolved !== true || typeof data.clarification_id !== "string") {
-      throw new Error("MemoryOS returned an invalid clarification result.");
-    }
-    return {
-      resolved: true,
-      clarificationId: data.clarification_id,
-      resolution: params.answer,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 export async function POST(request: NextRequest) {
   try {
     const { userId } = await auth();
@@ -128,8 +35,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Sign in to use the assistant." }, { status: 401 });
     }
 
-    const body = (await request.json()) as Record<string, unknown>;
-    const action = body.action === "answer_clarification" ? "answer_clarification" : "chat";
+    const rawBody: unknown = await request.json().catch(() => null);
+    if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+      return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+    }
+    const body = rawBody as Record<string, unknown>;
+    const action = body.action ?? "chat";
+    if (action !== "chat" && action !== "answer_clarification" && action !== "answer_source_review") {
+      return NextResponse.json({ error: "Invalid assistant action." }, { status: 400 });
+    }
     const message = typeof body.message === "string" ? body.message.trim() : "";
     const externalUserId = `assistant:${userId}`;
 
@@ -138,14 +52,14 @@ export async function POST(request: NextRequest) {
     }
 
     const apiKey = configured("MEMORYOS_API_KEY");
+    const memory = new MemoryOS(apiKey);
     if (action === "answer_clarification") {
       const clarificationId = typeof body.clarificationId === "string" ? body.clarificationId.trim() : "";
       const answer = body.answer;
       if (!clarificationId || (answer !== "A" && answer !== "B" && answer !== "both" && answer !== "neither")) {
         return NextResponse.json({ error: "Invalid clarification answer." }, { status: 400 });
       }
-      const clarificationResolution = await answerClarification({
-        apiKey,
+      const clarificationResolution = await memory.answerClarification({
         clarificationId,
         externalUserId,
         answer,
@@ -153,18 +67,21 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ clarificationResolution });
     }
 
-    const history = cleanHistory(body.history);
-    let clarification: MemoryClarification | null = null;
-    const captureClarification: typeof fetch = async (input, init) => {
-      const response = await fetch(input, init);
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      if (response.ok && new URL(url).pathname.endsWith("/v1/memories/retrieve")) {
-        const payload = (await response.clone().json().catch(() => null)) as Record<string, unknown> | null;
-        clarification = parseClarification(payload?.clarification);
+    if (action === "answer_source_review") {
+      const reviewId = typeof body.reviewId === "string" ? body.reviewId.trim() : "";
+      const version = typeof body.version === "string" ? body.version : "";
+      const reviewAction = body.reviewAction;
+      if (!reviewId || !/^[a-f0-9]{64}$/.test(version) ||
+        (reviewAction !== "keep_current" && reviewAction !== "restate" && reviewAction !== "dismiss")) {
+        return NextResponse.json({ error: "Invalid source review answer." }, { status: 400 });
       }
-      return response;
-    };
-    const memory = new MemoryOS(apiKey, MemoryOS.DEFAULT_BASE_URL, MemoryOS.DEFAULT_TIMEOUT, captureClarification);
+      const sourceReviewResolution = await memory.answerSourceReview({
+        reviewId, externalUserId, version, action: reviewAction,
+      });
+      return NextResponse.json({ sourceReviewResolution });
+    }
+
+    const history = cleanHistory(body.history);
     const retrieved = await memory.get({
       query: message,
       externalUserId,
@@ -207,6 +124,21 @@ export async function POST(request: NextRequest) {
     if (!modelResponse.body) throw new Error("OpenAI returned an empty stream.");
 
     const encoder = new TextEncoder();
+    const context = {
+      retrievalId: retrieved.retrievalId,
+      clarification: retrieved.clarification,
+      sourceReviews: retrieved.sourceReviews ?? [],
+      memory: {
+        quotaMode: retrieved.quotaMode,
+        circuitStatus: retrieved.circuitStatus,
+        cached: retrieved.cached,
+        items: retrieved.items.map((item) => ({
+          id: item.id, content: item.content, category: item.category,
+          relevanceScore: item.relevanceScore, sourceEventId: item.sourceEventId,
+          provenance: item.provenance,
+        })),
+      },
+    };
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const send = (event: Record<string, unknown>) => {
@@ -214,6 +146,8 @@ export async function POST(request: NextRequest) {
         };
 
         try {
+          // Deliver already-retrieved reviews before tokens or the async write.
+          send({ type: "context", clarification: context.clarification, sourceReviews: context.sourceReviews });
           const reader = modelResponse.body!.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
@@ -262,21 +196,7 @@ export async function POST(request: NextRequest) {
 
           send({
             type: "complete",
-            retrievalId: retrieved.retrievalId,
-            clarification,
-            memory: {
-              quotaMode: retrieved.quotaMode,
-              circuitStatus: retrieved.circuitStatus,
-              cached: retrieved.cached,
-              items: retrieved.items.map((item) => ({
-                id: item.id,
-                content: item.content,
-                category: item.category,
-                relevanceScore: item.relevanceScore,
-                sourceEventId: item.sourceEventId,
-                provenance: item.provenance,
-              })),
-            },
+            ...context,
             write: {
               jobId: write.jobId,
               status: write.status,
@@ -304,10 +224,12 @@ export async function POST(request: NextRequest) {
     const status = error instanceof MemoryOSError && error.statusCode ? error.statusCode : 500;
     const publicMessage = status === 401
       ? "The assistant integration is not authorized."
+      : status === 403
+        ? "This integration is not permitted to answer memory checks."
       : status === 404
-        ? "This clarification is no longer available for this user."
+        ? "This memory check is no longer available for this user."
         : status === 409
-          ? "This clarification expired or was already answered. Ask another question to refresh the context."
+          ? "This memory check changed, expired or was already answered. Ask another question to refresh the context."
           : "The assistant could not complete this turn. Please try again.";
     console.error("assistant_turn_failed", error);
     return NextResponse.json({ error: publicMessage }, { status });
